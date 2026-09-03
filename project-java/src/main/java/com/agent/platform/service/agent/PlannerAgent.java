@@ -47,6 +47,9 @@ public class PlannerAgent {
             %s
             
             用户问题：%s
+
+            上下文信息：
+            %s
             
             请按以下格式输出执行计划：
             Step 1: [步骤描述] | Tool: [工具名称或none] | Args: [参数JSON或none]
@@ -84,7 +87,7 @@ public class PlannerAgent {
         String toolDescriptions = toolRegistry.buildToolDescriptions(availableTools);
 
         traceService.addSpan(traceId, "planner_planning", Map.of("query", query));
-        List<PlanStep> plan = generatePlan(query, toolDescriptions);
+        List<PlanStep> plan = generatePlan(query, context, toolDescriptions);
         log.info("生成执行计划，共 {} 个步骤", plan.size());
 
         List<ChatResponse.ThinkingStep> thinkingSteps = new ArrayList<>();
@@ -130,8 +133,9 @@ public class PlannerAgent {
                 .build();
     }
 
-    private List<PlanStep> generatePlan(String query, String toolDescriptions) {
-        String promptText = String.format(PLAN_PROMPT, toolDescriptions, query);
+    private List<PlanStep> generatePlan(String query, String context, String toolDescriptions) {
+        String safeContext = context != null ? context : "无历史上下文";
+        String promptText = String.format(PLAN_PROMPT, toolDescriptions, query, safeContext);
         String llmOutput = modelRouter.call(new Prompt(promptText), null)
                 .getResult().getOutput().getText();
 
