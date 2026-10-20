@@ -39,7 +39,7 @@ func (m *searchModel) Chat(_ context.Context, req *model.LLMRequest) (*model.LLM
 	}
 	last := req.Messages[len(req.Messages)-1].Content
 	if strings.HasPrefix(last, "Observation:") {
-		if strings.Contains(last, "MCP HTTP 429") {
+		if strings.Contains(last, "MCP HTTP 429") || strings.Contains(last, "load search session:") {
 			return &model.LLMResponse{Content: "Final Answer: Search unavailable"}, nil
 		}
 		if m.live {
@@ -287,11 +287,19 @@ func (o *observedLiveTransport) RoundTrip(r *http.Request) (*http.Response, erro
 type conversationCache struct {
 	mu     sync.Mutex
 	values map[string]string
+	lists  map[string][]string
+	getErr error
 }
 
 func (c *conversationCache) Get(_ context.Context, key string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.getErr != nil {
+		return "", c.getErr
+	}
+	if _, exists := c.lists[key]; exists {
+		return "", fmt.Errorf("WRONGTYPE")
+	}
 	return c.values[key], nil
 }
 func (c *conversationCache) Set(_ context.Context, key, value string, _ time.Duration) error {
@@ -303,6 +311,9 @@ func (c *conversationCache) Set(_ context.Context, key, value string, _ time.Dur
 func (c *conversationCache) SetNX(_ context.Context, key, value string, _ time.Duration) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if _, exists := c.lists[key]; exists {
+		return false, nil
+	}
 	if _, exists := c.values[key]; exists {
 		return false, nil
 	}
@@ -313,15 +324,41 @@ func (c *conversationCache) Delete(_ context.Context, key string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.values, key)
+	delete(c.lists, key)
 	return nil
 }
 func (c *conversationCache) Exists(ctx context.Context, key string) (bool, error) {
 	value, err := c.Get(ctx, key)
 	return value != "", err
 }
-func (*conversationCache) LPush(context.Context, string, ...interface{}) error { return nil }
-func (*conversationCache) LRange(context.Context, string, int64, int64) ([]string, error) {
-	return nil, nil
+func (c *conversationCache) LPush(_ context.Context, key string, values ...interface{}) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.values[key]; exists {
+		return fmt.Errorf("WRONGTYPE")
+	}
+	if c.lists == nil {
+		c.lists = make(map[string][]string)
+	}
+	for _, value := range values {
+		c.lists[key] = append([]string{fmt.Sprint(value)}, c.lists[key]...)
+	}
+	return nil
+}
+func (c *conversationCache) LRange(_ context.Context, key string, start, stop int64) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.values[key]; exists {
+		return nil, fmt.Errorf("WRONGTYPE")
+	}
+	values := c.lists[key]
+	if start >= int64(len(values)) {
+		return nil, nil
+	}
+	if stop < 0 || stop >= int64(len(values)) {
+		stop = int64(len(values)) - 1
+	}
+	return append([]string(nil), values[start:stop+1]...), nil
 }
 func (*conversationCache) LTrim(context.Context, string, int64, int64) error { return nil }
 func (*conversationCache) Close() error                                      { return nil }
@@ -368,5 +405,119 @@ func TestPlannerSearchConversation(t *testing.T) {
 	}
 	if len(capture.ids) != 4 || capture.ids[0] != capture.ids[1] || capture.ids[2] != capture.ids[3] || capture.ids[0] == capture.ids[2] {
 		t.Fatalf("wrong standalone run scope: %v", capture.ids)
+	}
+}
+
+// Arbitrary local session keys must never alias the search-ID Redis namespace.
+func TestSearchConversationKeyNamespace(t *testing.T) {
+	for _, searchFirst := range []bool{false, true} {
+		t.Run(fmt.Sprint(searchFirst), func(t *testing.T) {
+			storage := &conversationCache{values: make(map[string]string)}
+			short := memory.NewShortTermMemory(storage, 20)
+			saveHistory := func() {
+				if err := short.Save(context.Background(), &model.MemoryEntry{SessionID: "foo:search_id", Content: "unrelated history"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			search := func() {
+				if _, err := short.SearchSessionID(context.Background(), "foo"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if searchFirst {
+				search()
+				saveHistory()
+			} else {
+				saveHistory()
+				search()
+			}
+			if err := short.Clear(context.Background(), "foo"); err != nil {
+				t.Fatal(err)
+			}
+			history, err := short.Load(context.Background(), "foo:search_id", 10)
+			if err != nil || len(history) != 1 || history[0].Content != "unrelated history" {
+				t.Fatalf("clearing one conversation damaged another: %+v %v", history, err)
+			}
+		})
+	}
+}
+
+type calculatorModel struct{}
+
+func (*calculatorModel) Name() string                 { return "calculator-script" }
+func (*calculatorModel) Healthy(context.Context) bool { return true }
+func (*calculatorModel) ChatStream(context.Context, *model.LLMRequest) (<-chan llm.StreamEvent, error) {
+	return nil, fmt.Errorf("unused")
+}
+func (*calculatorModel) Chat(_ context.Context, req *model.LLMRequest) (*model.LLMResponse, error) {
+	if len(req.Messages) == 1 && strings.Contains(req.Messages[0].Content, "意图识别引擎") {
+		return &model.LLMResponse{Content: `{"intent":"tool_use","confidence":1}`}, nil
+	}
+	last := req.Messages[len(req.Messages)-1].Content
+	if strings.HasPrefix(last, "Observation:") {
+		if strings.Contains(last, "错误") || !strings.Contains(last, "2") {
+			return nil, fmt.Errorf("calculator did not run: %s", last)
+		}
+		return &model.LLMResponse{Content: "Final Answer: 2"}, nil
+	}
+	action, _ := json.Marshal(map[string]string{"tool": "calculator", "input": `{"operation":"add","a":1,"b":1}`})
+	return &model.LLMResponse{Content: "Action: " + string(action)}, nil
+}
+
+type localSearch struct{}
+
+func (localSearch) Name() string                       { return "web_search" }
+func (localSearch) Description() string                { return "User-selected local search" }
+func (localSearch) Parameters() map[string]interface{} { return map[string]interface{}{} }
+func (localSearch) Execute(context.Context, string) (*tool.ToolResult, error) {
+	return tool.NewSuccessResult(`{"results":[{"url":"https://go.dev/doc/","excerpts":["Current Go documentation"]}]}`), nil
+}
+
+type forbidSearchTransport struct{ t *testing.T }
+
+func (f forbidSearchTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	f.t.Error("unexpected network request despite failed search metadata or explicit local tool")
+	return nil, fmt.Errorf("unexpected network")
+}
+
+func TestSearchMetadataFailureDoesNotBlockOtherTools(t *testing.T) {
+	previous := http.DefaultTransport
+	http.DefaultTransport = forbidSearchTransport{t}
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	for _, kind := range []string{"calculator with search disabled", "explicit search replacement", "builtin search storage error"} {
+		t.Run(kind, func(t *testing.T) {
+			logger := zap.NewNop()
+			registry := tool.NewRegistry()
+			var client llm.Client = &searchModel{}
+			expected := "Current Go documentation: https://go.dev/doc/"
+			switch kind {
+			case "calculator with search disabled":
+				registry.MustRegister(builtin.NewCalculatorTool(logger))
+				client = &calculatorModel{}
+				expected = "2"
+			case "explicit search replacement":
+				registry.MustRegister(localSearch{})
+			case "builtin search storage error":
+				registry.MustRegister(builtin.NewSearchTool(logger))
+				expected = "Search unavailable"
+			}
+			router := llm.NewRouter(map[string]llm.Client{client.Name(): client}, client.Name(), config.CBConfig{FailureThreshold: 100, SuccessThreshold: 1})
+			storage := &conversationCache{values: make(map[string]string), getErr: fmt.Errorf("metadata unavailable")}
+			manager := memory.NewManager(memory.NewShortTermMemory(storage, 20), &emptyMemory{})
+			orchestrator := NewOrchestrator(OrchestratorDeps{ModelRouter: router, MemoryManager: manager, ToolRouter: tool.NewRouter(registry, logger), IntentRecognizer: intent.NewRecognizer(router, logger), Config: config.AgentConfig{MaxIterations: 3}, Logger: logger})
+			result, err := orchestrator.ProcessMessage(context.Background(), &model.ChatRequest{SessionID: "existing-session", Message: "Run selected tool"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Content != expected || len(result.ToolCalls) != 1 {
+				t.Fatalf("unrelated tool blocked or search error not consumed: %+v", result)
+			}
+			if kind == "builtin search storage error" && !strings.Contains(result.ToolCalls[0].Output, "load search session: metadata unavailable") {
+				t.Fatalf("missing explicit search failure: %+v", result.ToolCalls)
+			}
+			if len(storage.values) != 1 { // Existing Save writes the ordinary conversation TTL marker only.
+				t.Fatalf("failed search allocated identity: %+v", storage.values)
+			}
+		})
 	}
 }

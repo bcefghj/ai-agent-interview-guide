@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	shortTermKeyPrefix = "memory:short:"
-	shortTermTTL       = 2 * time.Hour
+	shortTermKeyPrefix     = "memory:short:"
+	shortTermTTL           = 2 * time.Hour
+	searchSessionKeyPrefix = "memory:search_session:"
 )
 
 // ShortTermMemory 基于 Redis 的短期记忆实现。
@@ -93,7 +94,7 @@ func (s *ShortTermMemory) Clear(ctx context.Context, sessionID string) error {
 	if err := s.cache.Delete(ctx, key); err != nil {
 		return err
 	}
-	return s.cache.Delete(ctx, key+":search_id")
+	return s.cache.Delete(ctx, searchSessionKeyPrefix+sessionID)
 }
 
 func (s *ShortTermMemory) buildKey(sessionID string) string {
@@ -105,7 +106,7 @@ func (s *ShortTermMemory) buildKey(sessionID string) string {
 // creation atomic across concurrent turns and multiple application instances.
 // Like the conversation history, this key lives until Clear removes it.
 func (s *ShortTermMemory) SearchSessionID(ctx context.Context, sessionID string) (string, error) {
-	key := s.buildKey(sessionID) + ":search_id"
+	key := searchSessionKeyPrefix + sessionID
 	id, err := s.cache.Get(ctx, key)
 	if err != nil {
 		return "", fmt.Errorf("load search session: %w", err)

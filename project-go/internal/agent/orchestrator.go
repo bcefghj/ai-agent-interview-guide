@@ -82,11 +82,10 @@ func (o *Orchestrator) ProcessMessage(ctx context.Context, req *model.ChatReques
 	}
 
 	if intentResult.Intent == intent.IntentToolUse || intentResult.Intent == intent.IntentComplexTask {
-		searchID, searchErr := o.deps.MemoryManager.SearchSessionID(ctx, req.SessionID)
-		if searchErr != nil {
-			return nil, fmt.Errorf("搜索会话初始化失败: %w", searchErr)
-		}
-		ctx = tool.WithSearchSession(ctx, searchID)
+		sessionID := req.SessionID
+		ctx = tool.WithSearchSessionResolver(ctx, func(searchCtx context.Context) (string, error) {
+			return o.deps.MemoryManager.SearchSessionID(searchCtx, sessionID)
+		})
 	}
 
 	// 2. 加载历史上下文

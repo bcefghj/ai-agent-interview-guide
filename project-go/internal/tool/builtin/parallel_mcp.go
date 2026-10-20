@@ -40,6 +40,10 @@ type rpcResponse struct {
 }
 
 func (t *SearchTool) search(ctx context.Context, query string, limit int) (string, error) {
+	sessionID, err := tool.SearchSession(ctx)
+	if err != nil {
+		return "", fmt.Errorf("search conversation: %w", err)
+	}
 	m := &searchMCP{tool: t, protocol: "2025-03-26"}
 	raw, err := m.request(ctx, 1, "initialize", map[string]interface{}{
 		"protocolVersion": m.protocol, "capabilities": map[string]interface{}{},
@@ -83,7 +87,7 @@ func (t *SearchTool) search(ctx context.Context, query string, limit int) (strin
 	if !found {
 		return "", fmt.Errorf("MCP server does not offer web_search")
 	}
-	args := map[string]interface{}{"objective": query, "search_queries": []string{query}, "session_id": tool.SearchSession(ctx)}
+	args := map[string]interface{}{"objective": query, "search_queries": []string{query}, "session_id": sessionID}
 	raw, err = m.request(ctx, 3, "tools/call", map[string]interface{}{"name": "web_search", "arguments": args})
 	if err != nil {
 		return "", err
