@@ -38,10 +38,10 @@ type OrchestratorDeps struct {
 // 3. 管理上下文记忆
 // 4. 编排 RAG 检索和工具调用
 type Orchestrator struct {
-	deps        OrchestratorDeps
-	reactAgent  *ReActAgent
-	planner     *PlannerAgent
-	reflector   *ReflectionAgent
+	deps       OrchestratorDeps
+	reactAgent *ReActAgent
+	planner    *PlannerAgent
+	reflector  *ReflectionAgent
 }
 
 // NewOrchestrator 创建 Agent 编排器并初始化所有子 Agent
@@ -79,6 +79,13 @@ func (o *Orchestrator) ProcessMessage(ctx context.Context, req *model.ChatReques
 	if err != nil {
 		o.deps.Logger.Warn("意图识别失败，使用默认策略", zap.Error(err))
 		intentResult = &model.IntentResult{Intent: "chat", Confidence: 0.5}
+	}
+
+	if intentResult.Intent == intent.IntentToolUse || intentResult.Intent == intent.IntentComplexTask {
+		sessionID := req.SessionID
+		ctx = tool.WithSearchSessionResolver(ctx, func(searchCtx context.Context) (string, error) {
+			return o.deps.MemoryManager.SearchSessionID(searchCtx, sessionID)
+		})
 	}
 
 	// 2. 加载历史上下文

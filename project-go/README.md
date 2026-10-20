@@ -114,6 +114,47 @@ make docker-run
 | GET  | `/api/v1/documents/:id` | 查询文档状态 |
 | GET  | `/health` | 健康检查 |
 
+## 网络搜索
+
+内置的 `web_search` 默认通过 [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)
+执行真实网络搜索，使用 Fast 模式，无需注册账号或配置搜索 API Key。
+原有的工具注册和路由方式保持一致，ReAct 和 Planner 会将搜索结果中的 URL、标题和摘要传入后续模型调用。
+LLM 仍使用项目原有的模型配置。
+
+工具输入示例：
+
+```json
+{"query": "Go 官方文档", "max_results": 5}
+```
+
+`query` 必填。`max_results` 默认为 5，上限为 20；该值在客户端截取返回结果，
+不改变服务端检索数量。结果为包含 `results` 数组的 JSON 文本，保留来源 URL 和摘要。
+搜索失败或请求取消会沿现有工具错误路径返回，不会使用模拟结果或切换到其他服务。
+每次搜索的总超时为 25 秒，并遵守调用方更短的 Context 截止时间。
+
+搜索请求使用 `https://search.parallel.ai/mcp` 的匿名 Streamable HTTP 接口，
+不会读取环境中的 Parallel API Key。匿名服务有使用额度，额度不足会作为工具错误返回。
+这项集成只提供搜索，不注册 `web_fetch`。
+
+编排器为每个需要工具的对话生成独立的随机搜索 ID，通过 Redis 与短期对话一起保存，
+后续轮次及进程重启后复用；
+用户提供的 `session_id` 不会发送给搜索服务。`MemoryManager.ClearSession` 会重置该 ID，
+新对话会生成新 ID。搜索 ID 会随短期对话清理，不在进程中缓存。
+直接调用 ReAct 或 Planner 时，一次运行视为一次独立研究任务。
+自定义工具仍可通过注册中心替换 `web_search`，或调用 `Unregister("web_search")` 禁用搜索。
+
+确定性测试不需要外部服务：
+
+```bash
+go test ./internal/tool/... ./internal/agent/...
+```
+
+可选的匿名在线检查会实际执行一次搜索：
+
+```bash
+RUN_PARALLEL_LIVE=1 go test -v ./internal/tool/builtin -run '^TestParallelLiveSearch$' -count=1
+```
+
 ## 设计亮点
 
 1. **三态熔断器**：支持 Closed/Open/HalfOpen 三种状态，保护 LLM 调用链路

@@ -16,6 +16,7 @@ import (
 type Cache interface {
 	Get(ctx context.Context, key string) (string, error)
 	Set(ctx context.Context, key string, value string, ttl time.Duration) error
+	SetNX(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
 	Delete(ctx context.Context, key string) error
 	Exists(ctx context.Context, key string) (bool, error)
 	LPush(ctx context.Context, key string, values ...interface{}) error
@@ -63,6 +64,11 @@ func (r *RedisCache) Get(ctx context.Context, key string) (string, error) {
 // Set 设置缓存值，ttl 为 0 表示永不过期
 func (r *RedisCache) Set(ctx context.Context, key string, value string, ttl time.Duration) error {
 	return r.client.Set(ctx, key, value, ttl).Err()
+}
+
+// SetNX atomically creates a value only when the key does not exist.
+func (r *RedisCache) SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	return r.client.SetNX(ctx, key, value, ttl).Result()
 }
 
 // Delete 删除缓存

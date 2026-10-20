@@ -4,6 +4,7 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/enterprise/ai-agent-go/internal/model"
@@ -93,4 +94,16 @@ func (m *Manager) ClearSession(ctx context.Context, sessionID string) error {
 		return err
 	}
 	return m.longTerm.Clear(ctx, sessionID)
+}
+
+// SearchSessionID delegates identity persistence to the conversation store. IDs
+// survive process restarts and are cleared with the short-term conversation.
+func (m *Manager) SearchSessionID(ctx context.Context, sessionID string) (string, error) {
+	store, ok := m.shortTerm.(interface {
+		SearchSessionID(context.Context, string) (string, error)
+	})
+	if !ok {
+		return "", fmt.Errorf("short-term memory does not support search session persistence")
+	}
+	return store.SearchSessionID(ctx, sessionID)
 }

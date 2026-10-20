@@ -61,6 +61,8 @@ func NewPlannerAgent(router *llm.Router, toolRouter *tool.Router, logger *zap.Lo
 
 // Execute 执行复杂任务：生成计划 → 逐步执行 → 汇总结果
 func (p *PlannerAgent) Execute(ctx context.Context, task string, history []model.LLMMessage) (*AgentResult, error) {
+	ctx = tool.EnsureSearchSession(ctx)
+
 	// 阶段一：生成执行计划
 	plan, err := p.generatePlan(ctx, task)
 	if err != nil {
