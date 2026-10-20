@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/enterprise/ai-agent-go/internal/cache"
 	"github.com/enterprise/ai-agent-go/internal/model"
 )
@@ -88,9 +90,42 @@ func (s *ShortTermMemory) Search(_ context.Context, _ string, _ int) ([]*model.M
 // Clear 清除指定会话的短期记忆
 func (s *ShortTermMemory) Clear(ctx context.Context, sessionID string) error {
 	key := s.buildKey(sessionID)
-	return s.cache.Delete(ctx, key)
+	if err := s.cache.Delete(ctx, key); err != nil {
+		return err
+	}
+	return s.cache.Delete(ctx, key+":search_id")
 }
 
 func (s *ShortTermMemory) buildKey(sessionID string) string {
 	return shortTermKeyPrefix + sessionID
+}
+
+// SearchSessionID persists a random ID beside the conversation without sharing
+// user-controlled conversation keys with the search service. SET NX makes first
+// creation atomic across concurrent turns and multiple application instances.
+// Like the conversation history, this key lives until Clear removes it.
+func (s *ShortTermMemory) SearchSessionID(ctx context.Context, sessionID string) (string, error) {
+	key := s.buildKey(sessionID) + ":search_id"
+	id, err := s.cache.Get(ctx, key)
+	if err != nil {
+		return "", fmt.Errorf("load search session: %w", err)
+	}
+	if id == "" {
+		candidate := uuid.NewString()
+		created, err := s.cache.SetNX(ctx, key, candidate, 0)
+		if err != nil {
+			return "", fmt.Errorf("create search session: %w", err)
+		}
+		if created {
+			return candidate, nil
+		}
+		id, err = s.cache.Get(ctx, key)
+		if err != nil {
+			return "", fmt.Errorf("load concurrent search session: %w", err)
+		}
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		return "", fmt.Errorf("stored search session is not a UUID")
+	}
+	return id, nil
 }

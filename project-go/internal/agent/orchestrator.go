@@ -73,13 +73,20 @@ func NewOrchestrator(deps OrchestratorDeps) *Orchestrator {
 // 意图识别 → 加载上下文 → 策略路由 → 执行 Agent → 保存记忆 → 返回结果
 func (o *Orchestrator) ProcessMessage(ctx context.Context, req *model.ChatRequest) (*model.ChatResponse, error) {
 	startTime := time.Now()
-	ctx = tool.WithSearchSession(ctx, o.deps.MemoryManager.SearchSessionID(req.SessionID))
 
 	// 1. 意图识别
 	intentResult, err := o.deps.IntentRecognizer.Recognize(ctx, req.Message)
 	if err != nil {
 		o.deps.Logger.Warn("意图识别失败，使用默认策略", zap.Error(err))
 		intentResult = &model.IntentResult{Intent: "chat", Confidence: 0.5}
+	}
+
+	if intentResult.Intent == intent.IntentToolUse || intentResult.Intent == intent.IntentComplexTask {
+		searchID, searchErr := o.deps.MemoryManager.SearchSessionID(ctx, req.SessionID)
+		if searchErr != nil {
+			return nil, fmt.Errorf("搜索会话初始化失败: %w", searchErr)
+		}
+		ctx = tool.WithSearchSession(ctx, searchID)
 	}
 
 	// 2. 加载历史上下文

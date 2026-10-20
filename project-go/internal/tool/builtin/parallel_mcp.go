@@ -235,7 +235,7 @@ func (m *searchMCP) close(parent context.Context) {
 	if m.session == "" {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), time.Second)
+	ctx, cancel := context.WithTimeout(parent, time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, m.tool.endpoint, nil)
 	if err != nil {

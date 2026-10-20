@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -145,7 +146,8 @@ func TestSearchThroughOrchestrator(t *testing.T) {
 	registry := tool.NewRegistry()
 	registry.MustRegister(builtin.NewSearchTool(logger))
 	modelRouter := llm.NewRouter(map[string]llm.Client{"scripted": &searchModel{}}, "scripted", config.CBConfig{FailureThreshold: 100, SuccessThreshold: 1})
-	manager := memory.NewManager(&emptyMemory{}, &emptyMemory{})
+	sessionCache := &conversationCache{values: make(map[string]string)}
+	manager := memory.NewManager(memory.NewShortTermMemory(sessionCache, 20), &emptyMemory{})
 	orchestrator := NewOrchestrator(OrchestratorDeps{ModelRouter: modelRouter, MemoryManager: manager, ToolRouter: tool.NewRouter(registry, logger), IntentRecognizer: intent.NewRecognizer(modelRouter, logger), Config: config.AgentConfig{MaxIterations: 3}, Logger: logger})
 	run := func(session string) {
 		response, err := orchestrator.ProcessMessage(context.Background(), &model.ChatRequest{SessionID: session, Message: "Find Go documentation"})
@@ -158,6 +160,8 @@ func TestSearchThroughOrchestrator(t *testing.T) {
 		}
 	}
 	run("user@example.com") // user-controlled conversation keys must not leave the app
+	manager = memory.NewManager(memory.NewShortTermMemory(sessionCache, 20), &emptyMemory{})
+	orchestrator.deps.MemoryManager = manager
 	run("user@example.com")
 	run("independent")
 	var wg sync.WaitGroup
@@ -197,11 +201,22 @@ func TestSearchThroughOrchestrator(t *testing.T) {
 	}
 	run("user@example.com")
 	capture.mu.Lock()
-	defer capture.mu.Unlock()
 	for _, id := range capture.ids[5:] {
 		if id != resetID {
-			t.Fatalf("retry changed identity: %v", capture.ids)
+			t.Errorf("retry changed identity: %v", capture.ids)
 		}
+	}
+	capture.mu.Unlock()
+	// Concurrent first turns in one new conversation select a single persisted ID.
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); run("concurrent-first-turn") }()
+	}
+	wg.Wait()
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if len(capture.ids) != 10 || capture.ids[8] != capture.ids[9] || capture.ids[8] == resetID {
+		t.Fatalf("concurrent first creation split identities: %v", capture.ids)
 	}
 }
 
@@ -220,7 +235,8 @@ func TestSearchThroughOrchestratorLive(t *testing.T) {
 	registry := tool.NewRegistry()
 	registry.MustRegister(builtin.NewSearchTool(logger))
 	modelRouter := llm.NewRouter(map[string]llm.Client{"scripted": &searchModel{live: true}}, "scripted", config.CBConfig{FailureThreshold: 100, SuccessThreshold: 1})
-	manager := memory.NewManager(&emptyMemory{}, &emptyMemory{})
+	sessionCache := &conversationCache{values: make(map[string]string)}
+	manager := memory.NewManager(memory.NewShortTermMemory(sessionCache, 20), &emptyMemory{})
 	orchestrator := NewOrchestrator(OrchestratorDeps{ModelRouter: modelRouter, MemoryManager: manager, ToolRouter: tool.NewRouter(registry, logger), IntentRecognizer: intent.NewRecognizer(modelRouter, logger), Config: config.AgentConfig{MaxIterations: 3}, Logger: logger})
 	result, err := orchestrator.ProcessMessage(context.Background(), &model.ChatRequest{SessionID: "local-live-conversation", Message: "Find Go documentation"})
 	if err != nil {
@@ -264,4 +280,93 @@ func (o *observedLiveTransport) RoundTrip(r *http.Request) (*http.Response, erro
 	o.t.Logf("Observed live request: %s %s; method=%s; User-Agent=%s; Authorization absent", r.Method, r.URL, request.Method, r.UserAgent())
 	o.requests++
 	return o.base.RoundTrip(r)
+}
+
+// Deterministic Redis substitute. Identity creation still executes the production
+// ShortTermMemory Get/SET NX path, including concurrent winner selection.
+type conversationCache struct {
+	mu     sync.Mutex
+	values map[string]string
+}
+
+func (c *conversationCache) Get(_ context.Context, key string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.values[key], nil
+}
+func (c *conversationCache) Set(_ context.Context, key, value string, _ time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.values[key] = value
+	return nil
+}
+func (c *conversationCache) SetNX(_ context.Context, key, value string, _ time.Duration) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.values[key]; exists {
+		return false, nil
+	}
+	c.values[key] = value
+	return true, nil
+}
+func (c *conversationCache) Delete(_ context.Context, key string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.values, key)
+	return nil
+}
+func (c *conversationCache) Exists(ctx context.Context, key string) (bool, error) {
+	value, err := c.Get(ctx, key)
+	return value != "", err
+}
+func (*conversationCache) LPush(context.Context, string, ...interface{}) error { return nil }
+func (*conversationCache) LRange(context.Context, string, int64, int64) ([]string, error) {
+	return nil, nil
+}
+func (*conversationCache) LTrim(context.Context, string, int64, int64) error { return nil }
+func (*conversationCache) Close() error                                      { return nil }
+func (*conversationCache) Healthy(context.Context) bool                      { return true }
+
+// The Planner passes the same conversation context through multiple tool steps
+// and presents the resulting sources to its summarizing model call.
+type plannerSearchModel struct{}
+
+func (*plannerSearchModel) Name() string                 { return "planner-script" }
+func (*plannerSearchModel) Healthy(context.Context) bool { return true }
+func (*plannerSearchModel) ChatStream(context.Context, *model.LLMRequest) (<-chan llm.StreamEvent, error) {
+	return nil, fmt.Errorf("unused")
+}
+func (*plannerSearchModel) Chat(_ context.Context, req *model.LLMRequest) (*model.LLMResponse, error) {
+	if strings.Contains(req.Messages[0].Content, "任务规划专家") {
+		input := `{"query":"Go documentation","max_results":1}`
+		plan, _ := json.Marshal([]PlanStep{{Step: 1, Tool: "web_search", Input: input}, {Step: 2, Tool: "web_search", Input: input, DependsOn: []int{1}}})
+		return &model.LLMResponse{Content: string(plan)}, nil
+	}
+	if !strings.Contains(req.Messages[len(req.Messages)-1].Content, "https://go.dev/doc/") {
+		return nil, fmt.Errorf("planner did not consume source")
+	}
+	return &model.LLMResponse{Content: "Source: https://go.dev/doc/"}, nil
+}
+func TestPlannerSearchConversation(t *testing.T) {
+	capture := &captureSearchTransport{t: t}
+	previous := http.DefaultTransport
+	http.DefaultTransport = capture
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	logger := zap.NewNop()
+	registry := tool.NewRegistry()
+	registry.MustRegister(builtin.NewSearchTool(logger))
+	router := llm.NewRouter(map[string]llm.Client{"planner-script": &plannerSearchModel{}}, "planner-script", config.CBConfig{FailureThreshold: 100, SuccessThreshold: 1})
+	planner := NewPlannerAgent(router, tool.NewRouter(registry, logger), logger)
+	for i := 0; i < 2; i++ {
+		result, err := planner.Execute(context.Background(), "Find Go documentation", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Answer != "Source: https://go.dev/doc/" || len(result.ToolCalls) != 2 {
+			t.Fatalf("bad planner result: %+v", result)
+		}
+	}
+	if len(capture.ids) != 4 || capture.ids[0] != capture.ids[1] || capture.ids[2] != capture.ids[3] || capture.ids[0] == capture.ids[2] {
+		t.Fatalf("wrong standalone run scope: %v", capture.ids)
+	}
 }

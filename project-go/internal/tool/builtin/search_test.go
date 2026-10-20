@@ -261,3 +261,60 @@ func TestSearchRegistryOverride(t *testing.T) {
 		t.Fatalf("lost explicit provider: %+v %v", result, err)
 	}
 }
+
+// A server-assigned HTTP session must not make cancellation wait for cleanup.
+func TestMCPCancelAfterInitialize(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		t.Run(fmt.Sprint("deadline=", deadline), func(t *testing.T) {
+			reachedSearch := make(chan struct{})
+			release := make(chan struct{})
+			var once sync.Once
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					<-release
+					w.WriteHeader(204)
+					return
+				}
+				var req struct {
+					ID     int    `json:"id"`
+					Method string `json:"method"`
+				}
+				json.NewDecoder(r.Body).Decode(&req)
+				w.Header().Set("Content-Type", "application/json")
+				switch req.Method {
+				case "initialize":
+					w.Header().Set("Mcp-Session-Id", "assigned")
+					fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26"}}`)
+				case "notifications/initialized":
+					w.WriteHeader(202)
+				case "tools/list":
+					fmt.Fprint(w, `{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"web_search"}]}}`)
+				case "tools/call":
+					once.Do(func() { close(reachedSearch) })
+					<-release
+				}
+			}))
+			defer server.Close()
+			defer close(release)
+			search := NewSearchTool(zap.NewNop())
+			search.endpoint = server.URL
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if deadline {
+				var stop context.CancelFunc
+				ctx, stop = context.WithTimeout(ctx, 100*time.Millisecond)
+				defer stop()
+			} else {
+				go func() { <-reachedSearch; cancel() }()
+			}
+			start := time.Now()
+			_, err := search.Execute(ctx, `{"query":"test"}`)
+			if err == nil {
+				t.Fatal("canceled search succeeded")
+			}
+			if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+				t.Fatalf("canceled search waited for session cleanup: %v", elapsed)
+			}
+		})
+	}
+}
