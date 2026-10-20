@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -13,12 +16,14 @@ import (
 
 // SearchTool 网络搜索工具
 type SearchTool struct {
-	logger *zap.Logger
+	logger   *zap.Logger
+	client   *http.Client
+	endpoint string
 }
 
 // NewSearchTool 创建网络搜索工具
 func NewSearchTool(logger *zap.Logger) *SearchTool {
-	return &SearchTool{logger: logger}
+	return &SearchTool{logger: logger, client: &http.Client{Timeout: 25 * time.Second}, endpoint: parallelSearchEndpoint}
 }
 
 // Name 返回工具名称
@@ -58,6 +63,7 @@ func (t *SearchTool) Execute(ctx context.Context, input string) (*tool.ToolResul
 		return tool.NewErrorResult("参数解析失败: " + err.Error()), nil
 	}
 
+	params.Query = strings.TrimSpace(params.Query)
 	if params.Query == "" {
 		return tool.NewErrorResult("搜索关键词不能为空"), nil
 	}
@@ -66,12 +72,16 @@ func (t *SearchTool) Execute(ctx context.Context, input string) (*tool.ToolResul
 		params.MaxResults = 5
 	}
 
+	if params.MaxResults > 20 {
+		return tool.NewErrorResult("max_results 不能超过 20"), nil
+	}
 	t.logger.Info("执行网络搜索", zap.String("query", params.Query))
 
-	// 实际实现中调用搜索 API（Google/Bing/SerpAPI）
-	// results, err := searchAPI.Search(ctx, params.Query, params.MaxResults)
-	result := fmt.Sprintf("搜索「%s」返回 %d 条结果（搜索 API 未配置，此为模拟结果）",
-		params.Query, params.MaxResults)
-
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	result, err := t.search(ctx, params.Query, params.MaxResults)
+	if err != nil {
+		return nil, fmt.Errorf("Parallel 搜索失败: %w", err)
+	}
 	return tool.NewSuccessResult(result), nil
 }

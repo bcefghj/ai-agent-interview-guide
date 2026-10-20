@@ -38,10 +38,10 @@ type OrchestratorDeps struct {
 // 3. 管理上下文记忆
 // 4. 编排 RAG 检索和工具调用
 type Orchestrator struct {
-	deps        OrchestratorDeps
-	reactAgent  *ReActAgent
-	planner     *PlannerAgent
-	reflector   *ReflectionAgent
+	deps       OrchestratorDeps
+	reactAgent *ReActAgent
+	planner    *PlannerAgent
+	reflector  *ReflectionAgent
 }
 
 // NewOrchestrator 创建 Agent 编排器并初始化所有子 Agent
@@ -73,6 +73,7 @@ func NewOrchestrator(deps OrchestratorDeps) *Orchestrator {
 // 意图识别 → 加载上下文 → 策略路由 → 执行 Agent → 保存记忆 → 返回结果
 func (o *Orchestrator) ProcessMessage(ctx context.Context, req *model.ChatRequest) (*model.ChatResponse, error) {
 	startTime := time.Now()
+	ctx = tool.WithSearchSession(ctx, o.deps.MemoryManager.SearchSessionID(req.SessionID))
 
 	// 1. 意图识别
 	intentResult, err := o.deps.IntentRecognizer.Recognize(ctx, req.Message)

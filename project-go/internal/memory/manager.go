@@ -4,7 +4,10 @@ package memory
 
 import (
 	"context"
+	"sync"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/enterprise/ai-agent-go/internal/model"
 )
@@ -25,8 +28,9 @@ type Memory interface {
 // 写入时同时写入短期记忆，并异步沉淀到长期记忆。
 // 读取时先从短期记忆获取近期上下文，再从长期记忆补充相关知识。
 type Manager struct {
-	shortTerm Memory
-	longTerm  Memory
+	shortTerm      Memory
+	longTerm       Memory
+	searchSessions sync.Map // local conversation key -> opaque UUID, never user text
 }
 
 // NewManager 创建记忆管理器
@@ -92,5 +96,16 @@ func (m *Manager) ClearSession(ctx context.Context, sessionID string) error {
 	if err := m.shortTerm.Clear(ctx, sessionID); err != nil {
 		return err
 	}
-	return m.longTerm.Clear(ctx, sessionID)
+	if err := m.longTerm.Clear(ctx, sessionID); err != nil {
+		return err
+	}
+	m.searchSessions.Delete(sessionID)
+	return nil
+}
+
+// SearchSessionID keeps search correlation stable across turns without exposing
+// the user-supplied conversation key to the search service. ClearSession resets it.
+func (m *Manager) SearchSessionID(sessionID string) string {
+	id, _ := m.searchSessions.LoadOrStore(sessionID, uuid.NewString())
+	return id.(string)
 }

@@ -69,6 +69,8 @@ func NewReActAgent(router *llm.Router, toolRouter *tool.Router, maxIterations in
 // Run 执行 ReAct 推理循环。
 // 核心流程：Thought → Action → Observation → ... → Final Answer
 func (a *ReActAgent) Run(ctx context.Context, query string, history []model.LLMMessage) (*AgentResult, error) {
+	ctx = tool.WithSearchSession(ctx, tool.SearchSession(ctx))
+
 	// 构造工具描述
 	toolsDesc := a.buildToolsDescription()
 	systemPrompt := fmt.Sprintf(reactSystemPrompt, toolsDesc, a.maxIterations)
